@@ -1,6 +1,7 @@
 import express from 'express';
 import pg from 'pg';
 import dayjs from 'dayjs';
+import Joi from 'joi';
 
 const { Pool } = pg;
 
@@ -15,6 +16,10 @@ const connection = new Pool({
 const server = express();
 server.use(express.json());
 
+const categorieSchema = Joi.object({
+	name: Joi.string().required(),
+});
+
 server.post('/status', (req, res) => {
 	console.log('ok');
 	res.send('ok2');
@@ -24,7 +29,26 @@ server.post('/categories', async (req, res) => {
 	const { name } = req.body;
 	console.log(name);
 
+	const validation = categorieSchema.validate({ name });
+
+	if (validation.error) {
+		const errors = validation.error.details
+			.map((value) => value.message)
+			.join(',');
+
+		return res.status(400).send(errors);
+	}
+
 	try {
+		const existe = await connection.query(
+			'SELECT categories.id FROM categories WHERE name = $1;',
+			[name]
+		);
+
+		if (existe.rows.length !== 0) {
+			return res.status(409).send('Categoria já existe');
+		}
+
 		await connection.query('INSERT INTO categories (name) VALUES ($1);', [
 			name,
 		]);
@@ -56,10 +80,24 @@ server.post('/games', async (req, res) => {
 });
 
 server.get('/games', async (req, res) => {
-	const games = await connection.query('SELECT * FROM games;');
+	const games = await connection.query(
+		`SELECT 
+			games.*, 
+			categories.name AS "categoryName"
+		FROM games JOIN categories ON games."categoryId" = categories.id;`
+	);
 
-	console.log(games.rows);
-	res.send(games.rows);
+	const { name } = req.query;
+
+	if (name) {
+		const gamesFiltrados = games.rows.filter(
+			(game) => game.name.toLowerCase().indexOf(name.toLowerCase()) >= 0
+		);
+
+		return res.send(gamesFiltrados);
+	} else {
+		res.send(games.rows);
+	}
 });
 
 server.post('/customers', async (req, res) => {
@@ -139,10 +177,91 @@ server.post('/rentals', async (req, res) => {
 	}
 });
 
+server.post('/rentals/:id/return', async (req, res) => {
+	const { id } = req.params;
+	let now = dayjs();
+	const returnDate = now.format('YYYY-MM-DD');
+
+	//consulta o price per day atraves do rentals (id)
+	const pricePerDayByRental = await connection.query(
+		`
+	SELECT games."pricePerDay"
+	FROM rentals
+		JOIN games
+			ON rentals."gameId" = games.id WHERE rentals.id = $1;`,
+		[id]
+	);
+	//consulta o rent date atraves do rentals (id)
+	const rentDateByRental = await connection.query(
+		`
+	SELECT rentals."rentDate"
+	FROM rentals WHERE id = $1;`,
+		[id]
+	);
+
+	//consulta days rented
+	const daysRented = await connection.query(
+		`
+	SELECT rentals."daysRented"
+	FROM rentals WHERE id = $1;`,
+		[id]
+	);
+
+	try {
+		const data1 = new Date(rentDateByRental.rows[0].rentDate);
+		const data2 = new Date(returnDate);
+		const diffTime = Math.abs(data2 - data1);
+		const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+		const lateDays = diffDays - daysRented.rows[0].daysRented;
+
+		console.log(lateDays);
+
+		const rental = await connection.query(
+			`
+			UPDATE rentals SET
+				"returnDate" = $1, 
+				"delayFee" = $2 
+					WHERE id = $3;`,
+			[returnDate, pricePerDayByRental.rows[0].pricePerDay * lateDays, id]
+		);
+
+		res.send(returnDate);
+	} catch (error) {
+		console.log(error);
+	}
+});
+
 server.get('/rentals', async (req, res) => {
-	const rentals = await connection.query('SELECT rentals.*,  FROM rentals;');
+	const rentals = await connection.query(`
+	SELECT
+		rentals.*,
+		customers.id AS "customerId",
+		customers.name AS "customerName",
+		games.name AS "gameName",
+		games."categoryId",
+		categories.name AS "categoryName"
+	FROM rentals
+		JOIN customers
+			ON rentals."customerId" = customers.id
+		JOIN games
+			ON rentals."gameId" = games.id
+		JOIN categories
+			ON games."categoryId" = categories.id;`);
 
 	res.send(rentals.rows);
+});
+
+server.delete('/rentals/:id', async (req, res) => {
+	const { id } = req.params;
+
+	const deleteRental = await connection.query(
+		`
+	DELETE FROM rentals WHERE id = $1;
+	`,
+		[id]
+	);
+
+	res.send(200);
 });
 
 server.listen(4000, () => {
